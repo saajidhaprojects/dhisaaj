@@ -1,0 +1,9 @@
+PyQt5==5.15.9
+cx_Freeze==6.15
+transformers==4.30.2
+torch==1.13.1
+numpy==1.21.6
+sounddevice==0.4.6
+soundfile==0.12.1
+webrtcvad==2.0.10
+scipy==1.7.3
