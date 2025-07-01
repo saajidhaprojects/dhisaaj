@@ -1,27 +1,135 @@
 import torch
 import torchaudio
-from datasets import load_dataset
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+import sounddevice as sd
+import numpy as np
+import time # For adding slight delays if needed
 
-test_dataset = load_dataset("common_voice", "dv", split="test[:2%]")
+# --- Audio Parameters ---
+MIC_SAMPLE_RATE = 44100  # Default sample rate for microphone. Try `sd.query_devices()` to find your mic's rate.
+MODEL_SAMPLE_RATE = 16000 # Model's required sample rate
+RECORD_DURATION_SECONDS = 3 # Record audio in chunks of 3 seconds
 
-processor = Wav2Vec2Processor.from_pretrained("shahukareem/wav2vec2-large-xlsr-53-dhivehi")
-model = Wav2Vec2ForCTC.from_pretrained("shahukareem/wav2vec2-large-xlsr-53-dhivehi")
+def record_audio(duration, sample_rate):
+    """Records audio from the microphone for a given duration and sample rate."""
+    print(f"\nListening... (recording for {duration}s at {sample_rate}Hz)")
+    audio_data = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='float32')
+    sd.wait()  # Wait until recording is finished
+    # print("Recording finished.") # Less verbose for continuous loop
+    return np.ascontiguousarray(audio_data.squeeze())
 
-# Preprocessing the datasets.
-# We need to read the aduio files as arrays
-def speech_file_to_array_fn(batch):
-    speech_array, sampling_rate = torchaudio.load(batch["path"])
-    batch["speech"] = resampler(speech_array).squeeze().numpy()
-    return batch
+# --- Load Model and Processor ---
+print("Loading model and processor...")
+try:
+    processor = Wav2Vec2Processor.from_pretrained("shahukareem/wav2vec2-large-xlsr-53-dhivehi")
+    model = Wav2Vec2ForCTC.from_pretrained("shahukareem/wav2vec2-large-xlsr-53-dhivehi")
+    model.eval() # Set model to evaluation mode
+except Exception as e:
+    print(f"Error loading model/processor: {e}")
+    print("Please ensure you have a working internet connection and the model name is correct.")
+    exit()
+print("Model and processor loaded successfully.")
 
-test_dataset = test_dataset.map(speech_file_to_array_fn)
-inputs = processor(test_dataset["speech"][:2], sampling_rate=16_000, return_tensors="pt", padding=True)
+# --- Resampler ---
+resampler = None
+if MIC_SAMPLE_RATE != MODEL_SAMPLE_RATE:
+    try:
+        resampler = torchaudio.transforms.Resample(orig_freq=MIC_SAMPLE_RATE, new_freq=MODEL_SAMPLE_RATE)
+        print(f"Resampler created to convert {MIC_SAMPLE_RATE}Hz to {MODEL_SAMPLE_RATE}Hz audio.")
+    except Exception as e:
+        print(f"Error creating resampler: {e}")
+        # Optionally, exit or try to proceed without resampling if rates are already compatible
+        # For now, we'll assume it's critical if rates differ.
+        if MIC_SAMPLE_RATE != MODEL_SAMPLE_RATE:
+            print("Exiting due to resampler error.")
+            exit()
+else:
+    print("Microphone sample rate matches model sample rate. No resampling needed.")
 
-with torch.no_grad():
-    logits = model(inputs.input_values, attention_mask=inputs.attention_mask).logits
+# --- Transcription Function ---
+def transcribe_audio_chunk(audio_data_np):
+    """
+    Takes a NumPy array of audio data, resamples if necessary,
+    transcribes it, and returns the text.
+    """
+    if audio_data_np.size == 0:
+        # print("Empty audio chunk received.") # Debug
+        return ""
 
-predicted_ids = torch.argmax(logits, dim=-1)
+    audio_tensor = torch.from_numpy(audio_data_np).float()
 
-print("Prediction:", processor.batch_decode(predicted_ids))
-print("Reference:", test_dataset["sentence"][:2])
+    if resampler:
+        try:
+            audio_tensor_resampled = resampler(audio_tensor)
+        except Exception as e:
+            print(f"Error during resampling: {e}")
+            return "[Resampling Error]"
+    else:
+        audio_tensor_resampled = audio_tensor
+
+    # Ensure the resampled audio tensor is not empty and has a minimum length
+    # This threshold might need adjustment based on the model's requirements
+    if audio_tensor_resampled.nelement() < 200: # Check for number of elements
+        # print(f"Resampled audio too short: {audio_tensor_resampled.nelement()} elements.") # Debug
+        return ""
+
+
+    try:
+        inputs = processor(audio_tensor_resampled, sampling_rate=MODEL_SAMPLE_RATE, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            logits = model(inputs.input_values, attention_mask=inputs.attention_mask).logits
+        predicted_ids = torch.argmax(logits, dim=-1)
+        transcription = processor.batch_decode(predicted_ids)
+        return transcription[0]
+    except Exception as e:
+        print(f"Error during transcription: {e}")
+        return "[Transcription Error]"
+
+# --- Real-time Transcription Loop ---
+print("\nStarting real-time dictation. Press Ctrl+C to stop.")
+print("----------------------------------------------------")
+
+full_transcription = []
+
+try:
+    while True:
+        recorded_audio_np = record_audio(RECORD_DURATION_SECONDS, MIC_SAMPLE_RATE)
+
+        if recorded_audio_np.size > 0:
+            # Basic check for silence or very short audio before sending to model
+            # Normalize audio to check its energy. This is a very simple VAD.
+            # More sophisticated VAD (Voice Activity Detection) could be used here.
+            max_amplitude = np.abs(recorded_audio_np).max()
+            if max_amplitude < 0.01: # Threshold for silence, adjust as needed
+                print("(Silence detected or very quiet audio)")
+                continue # Skip transcription for silent chunks
+
+            print("Processing...")
+            text_output = transcribe_audio_chunk(recorded_audio_np)
+
+            if text_output and text_output not in ["[Resampling Error]", "[Transcription Error]"]:
+                print(f"Segment: {text_output}")
+                full_transcription.append(text_output)
+            elif not text_output:
+                print("(Empty transcription result)")
+
+
+        else:
+            print("(No audio recorded or recording was empty)")
+
+        # time.sleep(0.1) # Optional small delay
+
+except KeyboardInterrupt:
+    print("\n----------------------------------------------------")
+    print("Stopping dictation...")
+except Exception as e:
+    print(f"\nAn unexpected error occurred: {e}")
+finally:
+    print("\nFinal Transcription:")
+    final_text = " ".join(full_transcription).strip()
+    if final_text:
+        print(final_text)
+    else:
+        print("(No speech was transcribed)")
+    print("----------------------------------------------------")
+    print("Exiting.")
